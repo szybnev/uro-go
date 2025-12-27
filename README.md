@@ -1,61 +1,197 @@
 # uro
+
 Using a URL list for security testing can be painful as there are a lot of URLs that have uninteresting/duplicate content; **uro** aims to solve that.
 
-It doesn't make any http requests to the URLs and removes:
-- incremental urls e.g. `/page/1/` and `/page/2/`
+It doesn't make any HTTP requests to the URLs and removes:
+- incremental URLs e.g. `/page/1/` and `/page/2/`
 - blog posts and similar human written content e.g. `/posts/a-brief-history-of-time`
-- urls with same path but parameter value difference e.g. `/page.php?id=1` and `/page.php?id=2`
+- URLs with same path but parameter value difference e.g. `/page.php?id=1` and `/page.php?id=2`
 - images, js, css and other "useless" files
 
-![uro-demo](https://i.ibb.co/x2tWCC5/uro-demo.png)
+> This is a Go rewrite of the original [Python uro](https://github.com/szybnev/uro-go).
 
-#### Installation
-The recommended way to install uro is as follows:
-```
-pipx install uro
-```
-> Note: If you are using an older version of python, use `pip` instead of `pipx`
+## Installation
 
-### Basic Usage
-The quickest way to include uro in your workflow is to feed it data through stdin and print it to your terminal.
+### CLI Tool
+```bash
+go install github.com/szybnev/uro-go/cmd/uro@latest
 ```
+
+### As Library
+```bash
+go get github.com/szybnev/uro-go
+```
+
+### Build locally
+```bash
+git clone https://github.com/szybnev/uro-go
+cd uro
+make build
+# Binary will be in ./bin/uro
+```
+
+## CLI Usage
+
+```bash
 cat urls.txt | uro
+uro -i input.txt -o output.txt
+uro -w php,html,asp < urls.txt
+uro -f hasparams -f vuln < urls.txt
 ```
 
-### Advanced usage
-#### Reading urls from a file (-i/--input)
+### CLI Options
 
-`uro -i input.txt`
+| Option | Description |
+|--------|-------------|
+| `-i <file>` | Input file (default: stdin) |
+| `-o <file>` | Output file (default: stdout) |
+| `-w` | Whitelist extensions (comma-separated or multiple flags) |
+| `-b` | Blacklist extensions |
+| `-f` | Add filter |
+| `-h` | Show help |
+| `--version` | Show version |
 
-#### Writing urls to a file (-o/--output)
-If the file already exists, uro will not overwrite the contents. Otherwise, it will create a new file.
+### Filters
 
-`uro -i input.txt -o output.txt`
+| Filter | Description |
+|--------|-------------|
+| `hasparams` | Only URLs with query parameters |
+| `noparams` | Only URLs without parameters |
+| `hasext` | Only URLs with file extensions |
+| `noext` | Only URLs without extensions |
+| `allexts` | Don't filter by extension |
+| `keepcontent` | Keep human-written content (blogs) |
+| `keepslash` | Keep trailing slash in URLs |
+| `vuln` | Only URLs with potentially vulnerable parameters |
 
-#### Whitelist (`-w/--whitelist`)
-uro will ignore all other extensions except the ones provided.
+---
 
-`uro -w php asp html`
+## Library Usage
 
-**Note:** Extensionless pages e.g. `/books/1` will still be included. To remove them too, use  `--filter hasext`.
+### Basic Example
 
-#### Blacklist (`-b/--blacklist`)
-uro will ignore the given extensions.
+```go
+package main
 
-`uro -b jpg png js pdf`
+import (
+    "fmt"
+    "github.com/szybnev/uro-go"
+)
 
-**Note:** uro has a list of "useless" extensions which it removes by default; that list will be overridden by whatever extensions you provide through blacklist option. Extensionless pages e.g. /books/1 will still be included. To remove them too, use `--filter hasext`.
+func main() {
+    p := uro.NewProcessor(nil)
 
-#### Filters (-f/--filters)
-For granular control, uro supports the following filters:
+    p.Process("https://example.com/api/users")
+    p.Process("https://example.com/api/users/123")
+    p.Process("https://example.com/api/users/456") // filtered (same pattern)
+    p.Process("https://example.com/style.css")     // filtered (blacklisted)
 
-1. **hasparams:** only output urls that have query parameters e.g. `http://example.com/page.php?id=`
-2. **noparams:** only output urls that have no query parameters e.g. `http://example.com/page.php`
-3. **hasext:** only output urls that have extensions e.g. `http://example.com/page.php`
-4. **noext:** only output urls that have no extensions e.g. `http://example.com/page`
-5. **allexts:** don't remove any page based on extension e.g. keep `.jpg` which would be removed otherwise
-6. **keepcontent:** keep human written content e.g. blogs.
-7. **keepslash:** don't remove trailing slash from urls e.g. `http://example.com/page/`
-8. **vuln:** only output urls with parameters that are know to be vulnerable. [More info.](https://github.com/s0md3v/parth)
+    for _, url := range p.Results() {
+        fmt.Println(url)
+    }
+}
+```
 
-Example: `uro --filters hasexts hasparams`
+### With Options
+
+```go
+p := uro.NewProcessor(&uro.Options{
+    Whitelist: []string{"php", "html"},
+    Filters:   []string{"hasparams", "vuln"},
+    KeepSlash: true,
+})
+```
+
+### Process from io.Reader
+
+```go
+p := uro.NewProcessor(nil)
+
+file, _ := os.Open("urls.txt")
+defer file.Close()
+
+count := p.ProcessReader(file)
+fmt.Printf("Kept %d URLs\n", count)
+
+// Write results
+p.WriteResults(os.Stdout)
+```
+
+### API Reference
+
+#### Types
+
+```go
+// Options configures the URL processor
+type Options struct {
+    Whitelist []string  // Extensions to keep (e.g., []string{"php", "html"})
+    Blacklist []string  // Extensions to remove
+    Filters   []string  // Active filters: hasparams, noparams, hasext, noext, etc.
+    KeepSlash bool      // Preserve trailing slashes
+}
+
+// Processor handles URL deduplication
+type Processor struct { ... }
+```
+
+#### Functions
+
+```go
+// NewProcessor creates a new URL processor
+func NewProcessor(opts *Options) *Processor
+
+// Process adds a URL for deduplication, returns true if kept
+func (p *Processor) Process(rawURL string) bool
+
+// ProcessReader reads URLs from io.Reader, returns count of kept URLs
+func (p *Processor) ProcessReader(r io.Reader) int
+
+// Results returns all deduplicated URLs as a slice
+func (p *Processor) Results() []string
+
+// WriteResults writes URLs to io.Writer
+func (p *Processor) WriteResults(w io.Writer) error
+
+// Count returns number of unique URLs stored
+func (p *Processor) Count() int
+
+// Reset clears all processed URLs
+func (p *Processor) Reset()
+```
+
+### Options Reference
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `Whitelist` | `[]string` | Keep only these extensions + extensionless URLs |
+| `Blacklist` | `[]string` | Remove these extensions (default: common static files) |
+| `Filters` | `[]string` | Active filters (see Filters table above) |
+| `KeepSlash` | `bool` | Don't strip trailing slashes |
+
+### Full Example
+
+```go
+package main
+
+import (
+    "os"
+    "github.com/szybnev/uro-go"
+)
+
+func main() {
+    // Create processor with vuln filter
+    p := uro.NewProcessor(&uro.Options{
+        Filters: []string{"vuln", "hasparams"},
+    })
+
+    // Process from stdin
+    p.ProcessReader(os.Stdin)
+
+    // Output results
+    p.WriteResults(os.Stdout)
+}
+```
+
+## License
+
+Apache-2.0
