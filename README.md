@@ -8,7 +8,7 @@ It doesn't make any HTTP requests to the URLs and removes:
 - URLs with same path but parameter value difference e.g. `/page.php?id=1` and `/page.php?id=2`
 - images, js, css and other "useless" files
 
-> This is a Go rewrite of the original [Python uro](https://github.com/szybnev/uro-go).
+> This is a Go rewrite of the original [Python uro](https://github.com/s0md3v/uro).
 
 ## Installation
 
