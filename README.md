@@ -1,5 +1,7 @@
 # uro
 
+[Русская версия](README.ru.md)
+
 Using a URL list for security testing can be painful as there are a lot of URLs that have uninteresting/duplicate content; **uro** aims to solve that.
 
 It doesn't make any HTTP requests to the URLs and removes:
