@@ -48,6 +48,8 @@ uro -f hasparams -f vuln < urls.txt
 | `-w` | Whitelist extensions (comma-separated or multiple flags) |
 | `-b` | Blacklist extensions |
 | `-f` | Add filter |
+| `-j <num>` | Number of parallel workers (0=sequential, -1=NumCPU) |
+| `--stream` | Output URLs immediately as they are processed |
 | `-h` | Show help |
 | `--version` | Show version |
 
@@ -124,10 +126,12 @@ p.WriteResults(os.Stdout)
 ```go
 // Options configures the URL processor
 type Options struct {
-    Whitelist []string  // Extensions to keep (e.g., []string{"php", "html"})
-    Blacklist []string  // Extensions to remove
-    Filters   []string  // Active filters: hasparams, noparams, hasext, noext, etc.
-    KeepSlash bool      // Preserve trailing slashes
+    Whitelist    []string      // Extensions to keep (e.g., []string{"php", "html"})
+    Blacklist    []string      // Extensions to remove
+    Filters      []string      // Active filters: hasparams, noparams, hasext, noext, etc.
+    KeepSlash    bool          // Preserve trailing slashes
+    Workers      int           // Parallel workers (0=sequential, -1=NumCPU)
+    StreamOutput func(string)  // Callback for streaming output
 }
 
 // Processor handles URL deduplication
@@ -167,6 +171,31 @@ func (p *Processor) Reset()
 | `Blacklist` | `[]string` | Remove these extensions (default: common static files) |
 | `Filters` | `[]string` | Active filters (see Filters table above) |
 | `KeepSlash` | `bool` | Don't strip trailing slashes |
+| `Workers` | `int` | Number of parallel workers (0=sequential, -1=NumCPU) |
+| `StreamOutput` | `func(string)` | Callback for streaming mode (URLs output immediately) |
+
+### Streaming Mode
+
+```go
+p := uro.NewProcessor(&uro.Options{
+    StreamOutput: func(url string) {
+        fmt.Println(url)  // Output immediately
+    },
+})
+p.ProcessReader(os.Stdin)
+```
+
+### Parallel Processing
+
+```go
+p := uro.NewProcessor(&uro.Options{
+    Workers: 4,  // Use 4 workers, or -1 for NumCPU
+    StreamOutput: func(url string) {
+        fmt.Println(url)
+    },
+})
+p.ProcessReader(os.Stdin)
+```
 
 ### Full Example
 

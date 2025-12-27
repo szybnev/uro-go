@@ -22,11 +22,24 @@
 //	    Filters:   []string{"hasparams", "vuln"},
 //	})
 //
-// # Processing from io.Reader
+// # Streaming Mode
 //
-//	p := uro.NewProcessor(nil)
+//	p := uro.NewProcessor(&uro.Options{
+//	    StreamOutput: func(url string) {
+//	        fmt.Println(url)
+//	    },
+//	})
 //	p.ProcessReader(os.Stdin)
-//	p.WriteResults(os.Stdout)
+//
+// # Parallel Processing
+//
+//	p := uro.NewProcessor(&uro.Options{
+//	    Workers: 4,
+//	    StreamOutput: func(url string) {
+//	        fmt.Println(url)
+//	    },
+//	})
+//	p.ProcessReader(os.Stdin)
 package uro
 
 import (
@@ -35,11 +48,14 @@ import (
 	"io"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Version is the current version of uro
-const Version = "1.0.2"
+const Version = "1.1.0"
 
 // Options configures the URL processor behavior
 type Options struct {
@@ -66,6 +82,17 @@ type Options struct {
 	// KeepSlash preserves trailing slashes in URLs.
 	// Can also be enabled via Filters: []string{"keepslash"}
 	KeepSlash bool
+
+	// Workers sets the number of parallel workers for processing.
+	// If 0 or 1, processing is sequential.
+	// Use -1 for runtime.NumCPU().
+	Workers int
+
+	// StreamOutput is called immediately when a URL passes all filters.
+	// If set, URLs are output in streaming mode instead of being stored.
+	// This is useful for processing large files with minimal memory.
+	// Note: The callback must be thread-safe if Workers > 1.
+	StreamOutput func(url string)
 }
 
 // Processor handles URL deduplication
@@ -79,8 +106,13 @@ type Processor struct {
 	filters         []string
 	strict          bool
 	keepSlash       bool
+	streaming       bool
+	workers         int
+	streamOutput    func(string)
 	reInt           *regexp.Regexp
 	reContent       *regexp.Regexp
+	mu              sync.Mutex
+	count           int64
 }
 
 // NewProcessor creates a new URL processor with the given options.
@@ -90,6 +122,11 @@ func NewProcessor(opts *Options) *Processor {
 		opts = &Options{}
 	}
 
+	workers := opts.Workers
+	if workers < 0 {
+		workers = runtime.NumCPU()
+	}
+
 	p := &Processor{
 		opts:         opts,
 		urlMap:       make(map[string]map[string][]map[string]string),
@@ -97,6 +134,9 @@ func NewProcessor(opts *Options) *Processor {
 		patternsSeen: make(map[string]struct{}),
 		reInt:        regexp.MustCompile(`/\d+([?/]|$)`),
 		reContent:    regexp.MustCompile(`(post|blog)s?|docs|support/|/(\d{4}|pages?)/\d+/`),
+		streaming:    opts.StreamOutput != nil,
+		streamOutput: opts.StreamOutput,
+		workers:      workers,
 	}
 
 	p.setupFilters()
@@ -105,6 +145,7 @@ func NewProcessor(opts *Options) *Processor {
 
 // Process adds a URL to the processor for deduplication.
 // Returns true if the URL was kept, false if it was filtered out.
+// This method is thread-safe.
 func (p *Processor) Process(rawURL string) bool {
 	// Normalize
 	rawURL = strings.ToValidUTF8(rawURL, "")
@@ -123,12 +164,20 @@ func (p *Processor) Process(rawURL string) bool {
 		return false
 	}
 
-	return p.processURL(u)
+	return p.processURL(u, rawURL)
 }
 
 // ProcessReader reads URLs from an io.Reader (one per line) and processes them.
 // Returns the number of URLs that were kept.
+// If Workers > 1, processing is done in parallel.
 func (p *Processor) ProcessReader(r io.Reader) int {
+	if p.workers > 1 {
+		return p.processReaderParallel(r)
+	}
+	return p.processReaderSequential(r)
+}
+
+func (p *Processor) processReaderSequential(r io.Reader) int {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
@@ -142,8 +191,47 @@ func (p *Processor) ProcessReader(r io.Reader) int {
 	return count
 }
 
+func (p *Processor) processReaderParallel(r io.Reader) int {
+	lines := make(chan string, p.workers*100)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < p.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for line := range lines {
+				if p.Process(line) {
+					atomic.AddInt64(&p.count, 1)
+				}
+			}
+		}()
+	}
+
+	// Read and distribute lines
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		lines <- scanner.Text()
+	}
+	close(lines)
+
+	wg.Wait()
+	return int(atomic.LoadInt64(&p.count))
+}
+
 // Results returns all deduplicated URLs as a slice.
+// In streaming mode, this returns an empty slice.
 func (p *Processor) Results() []string {
+	if p.streaming {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	var results []string
 	for host, paths := range p.urlMap {
 		for path, paramsList := range paths {
@@ -160,7 +248,15 @@ func (p *Processor) Results() []string {
 }
 
 // WriteResults writes all deduplicated URLs to an io.Writer.
+// In streaming mode, this is a no-op since URLs were already output.
 func (p *Processor) WriteResults(w io.Writer) error {
+	if p.streaming {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	for host, paths := range p.urlMap {
 		for path, paramsList := range paths {
 			if len(paramsList) > 0 {
@@ -181,6 +277,13 @@ func (p *Processor) WriteResults(w io.Writer) error {
 
 // Count returns the number of unique URLs currently stored.
 func (p *Processor) Count() int {
+	if p.streaming {
+		return int(atomic.LoadInt64(&p.count))
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	count := 0
 	for _, paths := range p.urlMap {
 		for _, paramsList := range paths {
@@ -196,10 +299,14 @@ func (p *Processor) Count() int {
 
 // Reset clears all processed URLs and resets the processor state.
 func (p *Processor) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.urlMap = make(map[string]map[string][]map[string]string)
 	p.paramsSeen = make(map[string]struct{})
 	p.patternsSeen = make(map[string]struct{})
 	p.contentPrefixes = nil
+	atomic.StoreInt64(&p.count, 0)
 }
 
 // --- Internal methods ---
@@ -272,10 +379,18 @@ func (p *Processor) setupFilters() {
 	}
 }
 
-func (p *Processor) processURL(u *url.URL) bool {
+func (p *Processor) processURL(u *url.URL, rawURL string) bool {
 	host := u.Scheme + "://" + u.Host
 	path := u.Path
 	params := paramsToMap(u.RawQuery)
+
+	// Apply filters first (no lock needed for read-only filters)
+	if !p.applyFilters(path, params) {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Find new params
 	newParams := []string{}
@@ -283,11 +398,6 @@ func (p *Processor) processURL(u *url.URL) bool {
 		if _, seen := p.paramsSeen[param]; !seen {
 			newParams = append(newParams, param)
 		}
-	}
-
-	// Apply filters
-	if !p.applyFilters(path, params) {
-		return false
 	}
 
 	// Update seen params
@@ -318,15 +428,29 @@ func (p *Processor) processURL(u *url.URL) bool {
 		if len(params) > 0 {
 			p.urlMap[host][path] = append(p.urlMap[host][path], params)
 		}
+
+		// Stream output if enabled
+		if p.streaming {
+			atomic.AddInt64(&p.count, 1)
+			p.streamOutput(rawURL)
+		}
 		return true
 	}
 
 	// Path exists, check params
 	if len(newParams) > 0 {
 		p.urlMap[host][path] = append(p.urlMap[host][path], params)
+		if p.streaming {
+			atomic.AddInt64(&p.count, 1)
+			p.streamOutput(rawURL)
+		}
 		return true
 	} else if len(params) > 0 && compareParams(p.urlMap[host][path], params) {
 		p.urlMap[host][path] = append(p.urlMap[host][path], params)
+		if p.streaming {
+			atomic.AddInt64(&p.count, 1)
+			p.streamOutput(rawURL)
+		}
 		return true
 	}
 
@@ -398,6 +522,10 @@ func (p *Processor) checkContent(path string) bool {
 			return false
 		}
 	}
+
+	// Need lock for contentPrefixes
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Check cached prefixes
 	for _, prefix := range p.contentPrefixes {

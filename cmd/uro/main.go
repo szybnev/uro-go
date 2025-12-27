@@ -1,18 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
-	"github.com/szybnev/uro-go/internal/config"
-	"github.com/szybnev/uro-go/internal/processor"
-	"github.com/szybnev/uro-go/pkg/urlutil"
+	"github.com/szybnev/uro-go"
 )
 
-const version = "1.0.2"
+const version = "1.1.0"
 
 // arrayFlags позволяет передавать несколько значений через один флаг
 type arrayFlags []string
@@ -33,6 +31,8 @@ func main() {
 		whitelist  arrayFlags
 		blacklist  arrayFlags
 		filters    arrayFlags
+		workers    int
+		stream     bool
 		showHelp   bool
 		showVer    bool
 	)
@@ -45,6 +45,8 @@ func main() {
 	flag.Var(&blacklist, "blacklist", "remove these extensions")
 	flag.Var(&filters, "f", "additional filters (can be specified multiple times)")
 	flag.Var(&filters, "filters", "additional filters")
+	flag.IntVar(&workers, "j", 0, "number of parallel workers (0=sequential, -1=NumCPU)")
+	flag.BoolVar(&stream, "stream", false, "streaming mode (output URLs as they are processed)")
 	flag.BoolVar(&showHelp, "h", false, "show help")
 	flag.BoolVar(&showHelp, "help", false, "show help")
 	flag.BoolVar(&showVer, "version", false, "show version")
@@ -63,7 +65,7 @@ func main() {
 
 	// Проверяем keepslash в фильтрах
 	keepSlash := false
-	cleanFilters := urlutil.CleanArgs(filters)
+	cleanFilters := cleanArgs(filters)
 	for _, f := range cleanFilters {
 		if f == "keepslash" {
 			keepSlash = true
@@ -71,22 +73,41 @@ func main() {
 		}
 	}
 
-	// Создаём конфигурацию
-	cfg := &config.Config{
-		InputFile:  inputFile,
-		OutputFile: outputFile,
-		Whitelist:  urlutil.CleanArgs(whitelist),
-		Blacklist:  urlutil.CleanArgs(blacklist),
-		Filters:    cleanFilters,
-		KeepSlash:  keepSlash,
+	// Определяем вывод
+	var output *os.File
+	if outputFile != "" {
+		f, err := os.Create(outputFile) // Overwrite mode
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Cannot create output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		output = f
+	} else {
+		output = os.Stdout
+	}
+
+	// Создаём опции для процессора
+	opts := &uro.Options{
+		Whitelist: cleanArgs(whitelist),
+		Blacklist: cleanArgs(blacklist),
+		Filters:   cleanFilters,
+		KeepSlash: keepSlash,
+		Workers:   workers,
+	}
+
+	// Настраиваем streaming режим
+	var streamMu sync.Mutex
+	if stream {
+		opts.StreamOutput = func(url string) {
+			streamMu.Lock()
+			fmt.Fprintln(output, url)
+			streamMu.Unlock()
+		}
 	}
 
 	// Создаём процессор
-	proc, err := processor.New(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
-		os.Exit(1)
-	}
+	proc := uro.NewProcessor(opts)
 
 	// Определяем источник ввода
 	var input *os.File
@@ -108,37 +129,42 @@ func main() {
 		input = os.Stdin
 	}
 
-	// Читаем и обрабатываем строки
-	scanner := bufio.NewScanner(input)
-	// Увеличиваем буфер для длинных строк
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	// Обрабатываем URL
+	proc.ProcessReader(input)
 
-	for scanner.Scan() {
-		proc.ProcessLine(scanner.Text())
+	// Выводим результаты (если не streaming режим)
+	if !stream {
+		proc.WriteResults(output)
 	}
+}
 
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] Error reading input: %v\n", err)
-		os.Exit(1)
+// cleanArgs очищает и нормализует аргументы
+func cleanArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
 	}
-
-	// Определяем вывод
-	var output *os.File
-	if outputFile != "" {
-		f, err := os.Create(outputFile) // Overwrite mode (не append)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] Cannot create output file: %v\n", err)
-			os.Exit(1)
+	result := make(map[string]struct{})
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
 		}
-		defer f.Close()
-		output = f
-	} else {
-		output = os.Stdout
+		if strings.Contains(arg, ",") {
+			for _, part := range strings.Split(arg, ",") {
+				part = strings.TrimSpace(strings.ToLower(part))
+				if part != "" {
+					result[part] = struct{}{}
+				}
+			}
+		} else {
+			result[strings.ToLower(arg)] = struct{}{}
+		}
 	}
-
-	// Выводим результаты
-	proc.Output(output)
+	output := make([]string, 0, len(result))
+	for k := range result {
+		output = append(output, k)
+	}
+	return output
 }
 
 func printHelp() {
@@ -155,6 +181,8 @@ Options:
   -w, -whitelist   Only keep these extensions
   -b, -blacklist   Remove these extensions
   -f, -filters     Additional filters (see below)
+  -j <num>         Number of parallel workers (0=sequential, -1=NumCPU)
+  --stream         Output URLs immediately as they are processed
   -h, -help        Show this help
   --version        Show version
 
@@ -173,5 +201,7 @@ Examples:
   uro -i urls.txt -o clean.txt
   uro -w php,html,asp < urls.txt
   uro -w php -w html -w asp < urls.txt
-  uro -f hasparams -f vuln < urls.txt`)
+  uro -f hasparams -f vuln < urls.txt
+  uro -j 4 < urls.txt                  # 4 parallel workers
+  uro -j -1 --stream < urls.txt        # NumCPU workers, streaming output`)
 }
